@@ -1,0 +1,236 @@
+import torch
+import time
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms, models
+import numpy as np
+import argparse
+import os
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import scipy.io as sio
+from DFEM import DFEM,SpaFEM,SpeFEM,_3DLPFEM
+from SFEM import *
+from mymodel import mymodel,xxx,bicubic_up,xx
+from dataset.dataset_iter import MatImageset
+from eval.accuracy_cuda import *
+from loss.hybrid_loss import HybridLoss
+from loss.sam_loss import SamLoss
+from othermodels.d3fcn import d3fcn
+from othermodels.sspsr import SSPSR,default_conv
+from othermodels.gdrrn import GDRRN
+from othermodels.essaformer import ESSA
+# ==================== 1. 参数配置 ====================
+def parse_args():
+    parser = argparse.ArgumentParser(description='Super resolution for Hyperspectral images')
+    # 数据集参数
+    parser.add_argument('--dataset_name', type=str, default='botswana',choices=['botswana','pavia','pavia_U','houston'],
+                        help='数据集选择')
+    parser.add_argument('--data_dir', type=str, default='./data', help='数据集路径')
+    parser.add_argument('--patch_size', type=int, default=224, help='训练数据集图像大小')
+    
+    
+    # 设备参数
+    parser.add_argument('--n_cpu', type=int, default=4, help='数据加载线程数')
+    parser.add_argument('--seed', type=int, default=123, help='random seed to use. Default=123')
+    parser.add_argument('--gpu', type=str, default='0', help='the number of gpu id, only one number')
+    parser.add_argument('--cuda', action='store_true', default=True, help='use cuda?')
+    
+    # 模型参数
+    parser.add_argument('--model_name', type=str, default='mymodel', 
+                       choices=['mymodel','d3fcn', 'sspsr', 'gdrrn','essaformer','bicubic'], help='模型名称')
+    parser.add_argument('--pretrained', action='store_true', default=False,help='使用预训练模型')
+    parser.add_argument('--hidden_channels', type=int, default=256, help='深度特征提取的光谱通道数')
+    parser.add_argument('--SS2D_MBs_num', type=int, default=4, help='spafem中SS2D_MB数量')
+    parser.add_argument('--SS1D_MBs_num', type=int, default=8, help='spefem中SS1D_MB数量')
+    parser.add_argument('--SS3D_MBs_num', type=int, default=1, help='_3Dlpfem中SS3D_MB数量')
+    parser.add_argument('--spafem_N1', type=int, default=4, help='spafem数量')
+    parser.add_argument('--spefem_N2', type=int, default=4, help='spefem数量')
+    parser.add_argument('--DFEM_block_N3', type=int, default=3, help='dfem_block数量')
+    parser.add_argument('--upscale_factor', type=int, default=2, choices=[2, 4, 8], help='超分上采样系数')
+    parser.add_argument('--batchSize', type=int, default=16, help='训练批次大小')
+    parser.add_argument('--testBatchSize', type=int, default=16, help='推理批次大小')
+    
+    # 保存参数
+    parser.add_argument('--checkpoint_interval', type=int, default=-1, help='保存间隔(epoch)')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints', help='模型保存路径')
+    #-------------------------------
+  
+
+    return parser.parse_args()
+
+
+# ==================== 2. 自定义数据集 ====================
+
+
+
+# ==================== 3. 数据预处理 ====================
+
+# ==================== 3. 数据加载：返回数据加载器 ====================
+def load_data(args):
+    '''
+    数据加载器是迭代器，每次迭代产生的数据形状(B,C,H,W)
+    '''
+    HSI_Channels=0
+    if(args.dataset_name=='botswana'):
+        
+        file_name = './data/Botswana.mat'
+        data = sio.loadmat(file_name)['Botswana']
+        data = np.transpose(data, [2, 0, 1]).astype(np.float32)
+        HSI_Channels=145
+    elif(args.dataset_name=='pavia'):
+        file_name = './data/Pavia.mat'
+        data = sio.loadmat(file_name)['pavia']
+        data = np.transpose(data, [2, 0, 1]).astype(np.float32)
+        HSI_Channels=102
+    elif(args.dataset_name=='pavia_U'):
+        file_name = './data/PaviaU.mat'
+        data = sio.loadmat(file_name)['PaviaU']
+        data = np.transpose(data, [2, 0, 1]).astype(np.float32)
+        HSI_Channels=103
+    elif(args.dataset_name=='houston'):
+        file_name = './data/Houston.mat'
+        data = sio.loadmat(file_name)['Houston']
+        data = np.transpose(data, [2, 0, 1]).astype(np.float32)
+        HSI_Channels=144
+    # file_name2 = '../data/Pavia_bicubic_x2.mat'
+    # data2 = sio.loadmat(file_name2)['Pavia_bicubic_x2']
+    #
+    # # file_name2 = './data/Pavia_bicubic_x3.mat'
+    # # data2 = sio.loadmat(file_name2)['Pavia_bicubic_x3']
+    #
+    #file_name2 = 'data/Pavia.mat'
+    #data2 = sio.loadmat(file_name2)['Pavia_bicubic_x4']
+
+    #data2 = np.transpose(data2, [2, 0, 1]).astype(np.float32)
+    #train_data2 = data2[:, :946, :]
+    #test_data2 = data2[:, 946:, :150]
+    return HSI_Channels,data
+
+
+def build_model(HSI_Channels,args):
+    if args.model_name=='mymodel':
+        #sfem=xx(HSI_Channels,args.hidden_channels).to('cuda')
+        sfem=SFEM(HSI_Channels,args.hidden_channels,0).to('cuda')
+        spafem=SpaFEM((args.hidden_channels,int(args.patch_size/args.upscale_factor),int(args.patch_size/args.upscale_factor)),args.hidden_channels,(8,8),64,SS2D_MBs_num=args.SS2D_MBs_num,device='cuda').to('cuda')
+        spefem=SpeFEM((args.hidden_channels,int(args.patch_size/args.upscale_factor),int(args.patch_size/args.upscale_factor)),args.hidden_channels,16,SS1D_MBs_num=args.SS1D_MBs_num,device='cuda').to('cuda')
+        _3dlpfem=_3DLPFEM((args.hidden_channels,int(args.patch_size/args.upscale_factor),int(args.patch_size/args.upscale_factor)),args.hidden_channels,(16,8,8),32,SS3D_MBs_num=args.SS3D_MBs_num,device='cuda').to('cuda')
+        dfem=DFEM(args.spafem_N1,args.spefem_N2,spafem,spefem,args.hidden_channels,_3dlpfem,args.DFEM_block_N3).to('cuda')
+        #dfem=xxx()
+        model=mymodel(args.hidden_channels,HSI_Channels,sfem,dfem,args.upscale_factor).to('cuda')
+        #model.load_state_dict(torch.load(f"./checkpoints/{args.dataset_name}/best_{args.model_name}_x{args.upscale_factor}.pth"))
+    elif args.model_name == 'd3fcn':
+        model = d3fcn()
+    elif args.model_name == 'sspsr':
+        n_subs = 8
+        n_ovls = 1
+        colors = HSI_Channels
+        n_blocks = 4
+        n_feats = 256
+        n_scale = args.upscale_factor
+
+        model= SSPSR(n_subs=n_subs, n_ovls=n_ovls, n_colors=colors, n_blocks=n_blocks, n_feats=n_feats,
+                     
+                            n_scale=n_scale, res_scale=0.1, use_share=True, conv=default_conv)
+    elif args.model_name =='gdrrn':
+        model= GDRRN(input_chnl_hsi=HSI_Channels)
+    elif args.model_name =='essaformer':
+        model= ESSA(HSI_Channels, dim=256, upscale=args.upscale_factor)
+    return model
+
+
+
+
+
+
+
+# ==================== 7. 主函数 ====================
+def main():
+    args = parse_args()
+    
+    # 设置设备
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.cuda and not torch.cuda.is_available():
+        raise Exception("No GPU found, please run without --cuda")
+    
+    torch.manual_seed(args.seed)  # set the seed of the random number generator to a fixed value
+    # 创建保存目录
+    os.makedirs(args.save_dir, exist_ok=True)
+    
+    # 数据加载
+    HSI_Channels,train_loader,val_loader=load_data(args)
+    
+    
+    # 模型构建
+    model = build_model(HSI_Channels,args).to(device)
+    print('---------- Networks architecture -------------')
+    print_network(model)
+    # print_network(generator_spe)
+    print('----------------------------------------------')
+    # 损失函数和优化器True
+    criterion = HybridLoss(spatial_tv=True,spectral_tv=True).to(device)
+    
+    
+    # 训练循环
+    best_val = -100000
+    train_history = {'loss': []}
+    val_history = {'loss': [], 'PSNR': [], 'SAM': [], 'SSIM': [], 'ERGAS': []}
+    start = time.time()
+    if(args.model_name=='bicubic'):
+        val_loss, val_psnr, val_sam, val_ssim, val_ergas = validate(model, val_loader, criterion, device,args)
+        val_history['loss'].append(val_loss)
+        val_history['PSNR'].append(val_psnr)
+        val_history['SAM'].append(val_sam)
+        val_history['SSIM'].append(val_ssim)
+        val_history['ERGAS'].append(val_ergas)
+    
+        print(f'Val - Loss: {val_loss:.4f}, PSNR: {val_psnr:.4f}, '
+              f'SAM: {val_sam:.4f}, SSIM: {val_ssim:.4f}, ERGAS: {val_ergas:.4f}')
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(args.b1,args.b2),weight_decay=args.weight_decay,amsgrad=args.amsgrad)
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.decay_epoch, gamma=args.gamma)
+        for epoch in range(args.epoch, args.n_epochs):
+            print("===> Start training the {} epoch. ".format(epoch))
+            # 训练
+            train_loss= train_one_epoch(model, train_loader, criterion, optimizer, device, epoch,args)
+            train_history['loss'].append(train_loss)
+            
+            # 验证
+            val_loss, val_psnr, val_sam, val_ssim, val_ergas = validate(model, val_loader, criterion, device,args)
+            val_history['loss'].append(val_loss)
+            val_history['PSNR'].append(val_psnr)
+            val_history['SAM'].append(val_sam)
+            val_history['SSIM'].append(val_ssim)
+            val_history['ERGAS'].append(val_ergas)
+            
+            # 学习率调整
+            #scheduler.step()
+            
+            # 保存模型
+            if val_psnr> best_val:
+                best_val = val_psnr
+                torch.save(model.state_dict(), os.path.join(args.save_dir, f'{args.dataset_name}/best_{args.model_name}_x{args.upscale_factor}.pth'))
+            
+            checkpoint(epoch,args,model,args.upscale_factor)
+            
+            # 打印信息
+            print(f'Epoch {epoch+1}/{args.n_epochs}:')
+            print(f'Train - Loss: {train_loss:.4f}')
+            print(f'Val - Loss: {val_loss:.4f}, PSNR: {val_psnr:.4f}, '
+                f'SAM: {val_sam:.4f}, SSIM: {val_ssim:.4f}, ERGAS: {val_ergas:.4f}')
+        end = time.time()
+        print("===> Total time is: {:.2f}".format(end - start))
+        # 保存训练历史
+        torch.save({
+            'train_history': train_history,
+            'val_history': val_history,
+            'args': vars(args)
+        }, os.path.join(args.save_dir, f'{args.dataset_name}/{args.model_name}_training_history_x{args.upscale_factor}.pt'))
+    
+    
+
+
+if __name__ == '__main__':
+    main()
